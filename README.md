@@ -1,13 +1,24 @@
 # Chess AI Game
 
-This repository contains a **fully playable chess game with an AI opponent**. It is implemented entirely in HTML, CSS, and JavaScript so it runs in any modern web browser without additional dependencies.
+This repository contains a **fully playable chess game with an AI opponent** that **learns from everyone's games**. It runs in the browser and can sync with a global server so the AI improves as all players play.
+
+## Quick Start (with global sync)
+
+```bash
+cd server
+npm install
+npm start
+```
+
+Then open **http://localhost:3001/index.html** — games sync globally and the AI improves as everyone plays!
 
 ## Features
 
 - Responsive 8x8 chess board with light and dark squares and Unicode piece icons.
 - Supports all standard chess rules: pawn movement, double steps, en‑passant, pawn promotion, castling, check and checkmate detection.
 - Play as White against a simple AI that plays as Black.
-- The AI uses a minimax search with a basic evaluation function to choose moves. It is not as strong as engines like Stockfish but demonstrates the concepts behind computer chess.
+- **Machine learning**: The AI uses a neural network (TensorFlow.js) that learns from your games. After each game, it trains on the positions and outcomes, so the AI adapts to your play style over time.
+- The AI combines minimax search with both a static evaluation function and a learned evaluation from the neural network.
 
 ## Getting Started
 
@@ -16,6 +27,10 @@ This repository contains a **fully playable chess game with an AI opponent**. It
 3. The chess board will appear. Click a piece to select it, then click a destination square to move. When your move is complete, the AI will automatically respond.
 
 No installation or build step is required. The game logic and AI are contained directly in the HTML file.
+
+## Todo List
+
+See [TODO.md](TODO.md) for planned features and improvements.
 
 ## Files
 
