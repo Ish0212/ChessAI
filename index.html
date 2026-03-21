@@ -181,7 +181,7 @@ let replayIndex = 0;   // current position in replay (0 = start, replayData.leng
 const PIECE_TO_VAL = { 'P':1,'N':2,'B':3,'R':4,'Q':5,'K':6,'p':-1,'n':-2,'b':-3,'r':-4,'q':-5,'k':-6 };
 const STORAGE_KEY = 'chess_ai_training_data';
 const MODEL_STORAGE_PREFIX = 'chess-ai-model';
-const VEC_SIZE = 64;
+const VEC_SIZE = 65;
 const API_BASE = (typeof window !== 'undefined' && window.location.protocol === 'file:') ? 'http://localhost:3001' : '';
 const ELO_KEY = 'chess_ai_elo';
 const USER_ID_KEY = 'chess_ai_user_id';
@@ -232,7 +232,7 @@ function refreshElo() {
   if (aEl) aEl.textContent = elo.ai;
 }
 
-function boardToVector(stateBoard) {
+function boardToVector(stateBoard, whiteToMove) {
   const vec = [];
   for (let r = 0; r < 8; r++) {
     for (let c = 0; c < 8; c++) {
@@ -240,6 +240,7 @@ function boardToVector(stateBoard) {
       vec.push(p ? (PIECE_TO_VAL[p] || 0) / 6 : 0);
     }
   }
+  if (whiteToMove !== undefined) vec.push(whiteToMove ? 1 : -1);
   return vec;
 }
 
@@ -247,6 +248,12 @@ async function initLearnedModel() {
   if (typeof tf === 'undefined') return;
   try {
     learnedModel = await tf.loadLayersModel('localstorage://' + MODEL_STORAGE_PREFIX);
+    const inputShape = learnedModel.inputs[0].shape;
+    if (inputShape && inputShape[inputShape.length - 1] !== 65) {
+      learnedModel.dispose();
+      learnedModel = null;
+      throw new Error('Incompatible model shape');
+    }
     const global = await fetchGlobalGames();
     if (global.length > 0) {
       updateLearnStatus('Syncing ' + global.length + ' global games...');
@@ -260,7 +267,7 @@ async function initLearnedModel() {
   try {
     learnedModel = tf.sequential({
       layers: [
-        tf.layers.dense({ inputShape: [64], units: 128, activation: 'relu' }),
+        tf.layers.dense({ inputShape: [65], units: 128, activation: 'relu' }),
         tf.layers.dense({ units: 64, activation: 'relu' }),
         tf.layers.dense({ units: 1, activation: 'sigmoid' })
       ]
@@ -342,10 +349,8 @@ async function trainOnGames() {
   const ys = [];
   for (const g of games) {
     for (const item of g.positions) {
-      let vec = item.vec;
-      if (vec.length !== VEC_SIZE) {
-        vec = [...(vec.slice(0, 64)), 0,0,0,0,0,0,0,0].slice(0, VEC_SIZE);
-      }
+      const vec = item.vec;
+      if (!vec || vec.length !== VEC_SIZE) continue;
       xs.push(vec);
       ys.push((item.outcome + 1) / 2);
     }
@@ -399,8 +404,11 @@ async function sendGameToServer(positions, outcome) {
 function recordPosition(outcome) {
   if (moveHistory.length === 0) return;
   updateEloFromGame(outcome);
-  const positions = moveHistory.map(({ board: b }) => ({
-    vec: boardToVector(b),
+  if (outcome === 0) return;
+  const lastN = moveHistory.slice(-5);
+  const baseIdx = moveHistory.length - lastN.length;
+  const positions = lastN.map(({ board: b }, i) => ({
+    vec: boardToVector(b, (baseIdx + i) % 2 === 1),
     outcome
   }));
   sendGameToServer(positions, outcome);
@@ -412,16 +420,17 @@ function recordPosition(outcome) {
   trainOnGames();
 }
 
-function learnedEval(stateBoard, stateCastling, stateEnPassant, moveCount) {
+function learnedEval(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove) {
   if (typeof tf === 'undefined' || !learnedModel) return 0;
   try {
-    const vec = boardToVector(stateBoard);
+    const vec = boardToVector(stateBoard, whiteToMove);
+    if (vec.length !== 65) return 0;
     const pred = tf.tidy(() => {
       const input = tf.tensor2d([vec]);
       const out = learnedModel.predict(input);
       return out.dataSync()[0];
     });
-    return Math.round((pred - 0.5) * 120);
+    return Math.round((pred - 0.5) * 200);
   } catch (e) {
     return 0;
   }
@@ -934,7 +943,7 @@ function getPstScore(piece, r, c) {
 }
 
 // Evaluate board (material + piece-square + learned)
-function evaluateBoard(stateBoard, stateCastling, stateEnPassant, moveCount) {
+function evaluateBoard(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove) {
   let score = 0;
   for (let r=0;r<8;r++) {
     for (let c=0;c<8;c++) {
@@ -945,7 +954,7 @@ function evaluateBoard(stateBoard, stateCastling, stateEnPassant, moveCount) {
       }
     }
   }
-  score += learnedEval(stateBoard, stateCastling, stateEnPassant, moveCount);
+  score += learnedEval(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove);
   return score;
 }
 
@@ -982,7 +991,8 @@ function orderMoves(stateBoard, moves) {
 
 // Quiescence search: only captures, prevents horizon effect
 function quiesce(stateBoard, stateCastling, stateEnPassant, alpha, beta, maximizing, qDepth) {
-  const standPat = evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0);
+  const whiteToMove = !maximizing;
+  const standPat = evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0, whiteToMove);
   if (maximizing) {
     if (standPat >= beta) return beta;
     if (standPat > alpha) alpha = standPat;
@@ -1010,7 +1020,7 @@ function quiesce(stateBoard, stateCastling, stateEnPassant, alpha, beta, maximiz
 }
 
 // Alpha-beta search with quiescence (reduced depth for responsiveness)
-const SEARCH_DEPTH = 2;
+const SEARCH_DEPTH = 4;
 const QUIESCE_DEPTH = 3;
 
 function alphaBeta(stateBoard, stateCastling, stateEnPassant, depth, alpha, beta, maximizing) {
@@ -1018,7 +1028,8 @@ function alphaBeta(stateBoard, stateCastling, stateEnPassant, depth, alpha, beta
   const legal = getLegalMoves(stateBoard, stateCastling, stateEnPassant, color);
   if (legal.length === 0) {
     const inCheck = isKingInCheck(stateBoard, color, stateCastling, stateEnPassant);
-    return { score: inCheck ? (maximizing ? -30000 : 30000) : evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0) };
+    const whiteToMove = !maximizing;
+    return { score: inCheck ? (maximizing ? -30000 : 30000) : evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0, whiteToMove) };
   }
   if (depth === 0) {
     const qScore = quiesce(stateBoard, stateCastling, stateEnPassant, alpha, beta, maximizing, QUIESCE_DEPTH);
@@ -1028,31 +1039,39 @@ function alphaBeta(stateBoard, stateCastling, stateEnPassant, depth, alpha, beta
   let bestMove = ordered[0];
   if (maximizing) {
     let bestScore = -Infinity;
+    let tiedMoves = [ordered[0]];
     for (const mv of ordered) {
       const { board:nb, castling:nc, enPassant:ne } = makeMove(stateBoard, stateCastling, stateEnPassant, mv, color);
       const result = alphaBeta(nb, nc, ne, depth - 1, -beta, -alpha, false);
       const score = -result.score;
       if (score > bestScore) {
         bestScore = score;
-        bestMove = mv;
+        tiedMoves = [mv];
         if (bestScore > alpha) alpha = bestScore;
         if (alpha >= beta) break;
+      } else if (score === bestScore) {
+        tiedMoves.push(mv);
       }
     }
+    bestMove = tiedMoves[Math.floor(Math.random() * tiedMoves.length)];
     return { score: bestScore, move: bestMove };
   } else {
     let bestScore = Infinity;
+    let tiedMoves = [ordered[0]];
     for (const mv of ordered) {
       const { board:nb, castling:nc, enPassant:ne } = makeMove(stateBoard, stateCastling, stateEnPassant, mv, color);
       const result = alphaBeta(nb, nc, ne, depth - 1, -beta, -alpha, true);
       const score = -result.score;
       if (score < bestScore) {
         bestScore = score;
-        bestMove = mv;
+        tiedMoves = [mv];
         if (bestScore < beta) beta = bestScore;
         if (alpha >= beta) break;
+      } else if (score === bestScore) {
+        tiedMoves.push(mv);
       }
     }
+    bestMove = tiedMoves[Math.floor(Math.random() * tiedMoves.length)];
     return { score: bestScore, move: bestMove };
   }
 }
