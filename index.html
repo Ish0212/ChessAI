@@ -32,7 +32,7 @@
   }
   .square-light { background: #f0d9b5; }
   .square-dark { background: #b58863; }
-  .piece-white { color: #ffffff; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+  .piece-white { color: #ffffff; text-shadow: 0 1px 2px rgba(0,0,0,0.5), 0 0 1px rgba(0,0,0,0.8); -webkit-text-stroke: 0.5px rgba(0,0,0,0.35); }
   .piece-black { color: #1a1a2e; text-shadow: 0 1px 1px rgba(255,255,255,0.3); }
   .highlight { outline: 3px solid #4ade80; outline-offset: -2px; }
   .last-move { background: rgba(74, 222, 128, 0.35) !important; }
@@ -176,6 +176,8 @@ let pendingPromotion = null;  // { from, to, moves } when user must pick promoti
 let replayData = [];   // [{ board, castling, enPassant }] - positions for replay
 let replayMoves = [];  // [{ from, to, piece }] - moves for replay animation
 let replayIndex = 0;   // current position in replay (0 = start, replayData.length-1 = current)
+let animatingFromSquare = null;  // [r,c] - skip drawing piece here during slide (overlay starts here)
+let animatingToSquare = null;    // [r,c] - skip drawing piece here during slide (overlay ends here)
 
 // --- ML Learning from User Games ---
 const PIECE_TO_VAL = { 'P':1,'N':2,'B':3,'R':4,'Q':5,'K':6,'p':-1,'n':-2,'b':-3,'r':-4,'q':-5,'k':-6 };
@@ -242,6 +244,34 @@ function boardToVector(stateBoard, whiteToMove) {
   }
   if (whiteToMove !== undefined) vec.push(whiteToMove ? 1 : -1);
   return vec;
+}
+
+function boardToFen(stateBoard, stateCastling, stateEnPassant, whiteToMove) {
+  const files = 'abcdefgh';
+  let fen = '';
+  for (let r = 0; r < 8; r++) {
+    let empty = 0;
+    for (let c = 0; c < 8; c++) {
+      const p = stateBoard[r][c];
+      if (p) {
+        if (empty > 0) { fen += empty; empty = 0; }
+        fen += p;
+      } else empty++;
+    }
+    if (empty > 0) fen += empty;
+    if (r < 7) fen += '/';
+  }
+  fen += ' ' + (whiteToMove ? 'w' : 'b') + ' ';
+  let castling = '';
+  if (stateCastling.whiteKingSide) castling += 'K';
+  if (stateCastling.whiteQueenSide) castling += 'Q';
+  if (stateCastling.blackKingSide) castling += 'k';
+  if (stateCastling.blackQueenSide) castling += 'q';
+  fen += castling || '-';
+  fen += ' ';
+  fen += stateEnPassant ? files[stateEnPassant[1]] + (8 - stateEnPassant[0]) : '-';
+  fen += ' 0 1';
+  return fen;
 }
 
 async function initLearnedModel() {
@@ -352,7 +382,8 @@ async function trainOnGames() {
       const vec = item.vec;
       if (!vec || vec.length !== VEC_SIZE) continue;
       xs.push(vec);
-      ys.push((item.outcome + 1) / 2);
+      const target = item.target !== undefined ? item.target : (item.outcome + 1) / 2;
+      ys.push(target);
     }
   }
   if (xs.length < 2) return;
@@ -401,20 +432,55 @@ async function sendGameToServer(positions, outcome) {
   } catch (e) { console.warn('Could not sync game to server:', e); }
 }
 
-function recordPosition(outcome) {
+async function recordPosition(outcome) {
   if (moveHistory.length === 0) return;
   updateEloFromGame(outcome);
   if (outcome === 0) return;
-  const lastN = moveHistory.slice(-5);
-  const baseIdx = moveHistory.length - lastN.length;
-  const positions = lastN.map(({ board: b }, i) => ({
-    vec: boardToVector(b, (baseIdx + i) % 2 === 1),
-    outcome
-  }));
-  sendGameToServer(positions, outcome);
+  const allPositions = moveHistory;
+  const positions = allPositions.map(({ board: b, castling: c, enPassant: ep }, i) => {
+    const wtm = (i % 2 === 1);
+    return {
+      vec: boardToVector(b, wtm),
+      fen: boardToFen(b, c || { whiteKingSide: true, whiteQueenSide: true, blackKingSide: true, blackQueenSide: true }, ep || null, wtm),
+      outcome
+    };
+  });
+  let evals = null;
+  if (API_BASE) {
+    const statusEl = document.getElementById('status');
+    const BATCH = 50;
+    try {
+      for (let off = 0; off < positions.length; off += BATCH) {
+        const chunk = positions.slice(off, off + BATCH);
+        const fens = chunk.map(p => p.fen);
+        if (statusEl) statusEl.textContent = 'Analyzing position ' + (off + 1) + '/' + positions.length + '…';
+        const res = await fetch(API_BASE + '/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fens })
+        });
+        if (res.ok) {
+          const { evals: chunkEvals } = await res.json();
+          evals = evals || [];
+          evals.push(...chunkEvals);
+        } else throw new Error('Analyze failed');
+      }
+    } catch (e) {
+      console.warn('Stockfish analysis unavailable:', e);
+      evals = null;
+    }
+    if (statusEl) statusEl.textContent = '';
+  }
+  const finalPositions = positions.map((p, i) => {
+    const obj = { vec: p.vec };
+    if (evals && evals[i] !== undefined) obj.target = evals[i];
+    else obj.outcome = p.outcome;
+    return obj;
+  });
+  sendGameToServer(finalPositions, outcome);
   const raw = localStorage.getItem(STORAGE_KEY) || '[]';
   const games = JSON.parse(raw);
-  games.push({ positions, outcome });
+  games.push({ positions: finalPositions, outcome });
   while (games.length > 100) games.shift();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(games));
   trainOnGames();
@@ -457,6 +523,8 @@ function initBoard() {
   replayData = [{ board: cloneBoard(board), castling: cloneCastling(castlingRights), enPassant: null }];
   replayMoves = [];
   replayIndex = 0;
+  animatingFromSquare = null;
+  animatingToSquare = null;
   document.getElementById('promotionPicker')?.classList.remove('visible');
   updateReplayUI();
 }
@@ -485,7 +553,9 @@ function drawBoard() {
       square.dataset.row = r;
       square.dataset.col = c;
       const piece = board[r][c];
-      if (piece) {
+      const skipForAnimation = (animatingFromSquare && animatingFromSquare[0] === r && animatingFromSquare[1] === c) ||
+        (animatingToSquare && animatingToSquare[0] === r && animatingToSquare[1] === c);
+      if (piece && !skipForAnimation) {
         square.textContent = PIECE_UNICODE[piece];
         square.classList.add(isWhitePiece(piece) ? 'piece-white' : 'piece-black');
         if (lastMove && lastMove.to[0] === r && lastMove.to[1] === c) square.classList.add('piece-moved');
@@ -538,20 +608,42 @@ function refreshMoveNotation() {
   el.textContent = text.trim() || 'No moves yet';
 }
 
+function finishPieceAnimation() {
+  animatingFromSquare = null;
+  animatingToSquare = null;
+  const wrap = document.getElementById('board-wrap');
+  if (wrap) wrap.querySelectorAll('.piece-overlay').forEach(el => el.remove());
+  drawBoard();
+}
+
 function animatePieceSlide(from, to, pieceChar) {
   const wrap = document.getElementById('board-wrap');
   if (!wrap || !pieceChar) return;
+  wrap.querySelectorAll('.piece-overlay').forEach(el => el.remove());
+  animatingFromSquare = [from[0], from[1]];
+  animatingToSquare = [to[0], to[1]];
+  drawBoard();
   const overlay = document.createElement('div');
   overlay.className = 'piece-overlay ' + (isWhitePiece(pieceChar) ? 'piece-white' : 'piece-black');
-  overlay.style.cssText = 'width:56px;height:56px;display:flex;align-items:center;justify-content:center;position:absolute;left:' + (from[1]*56) + 'px;top:' + (from[0]*56) + 'px;font-size:36px;pointer-events:none;z-index:10;transition:left 0.25s ease-out, top 0.25s ease-out;';
+  const fromX = from[1] * 56, fromY = from[0] * 56, toX = to[1] * 56, toY = to[0] * 56;
+  overlay.style.cssText = 'width:56px;height:56px;display:flex;align-items:center;justify-content:center;position:absolute;left:' + fromX + 'px;top:' + fromY + 'px;font-size:36px;pointer-events:none;z-index:10;transition:transform 0.25s ease-out;';
   overlay.textContent = PIECE_UNICODE[pieceChar];
+  overlay.style.transform = 'translate(0, 0)';
   wrap.appendChild(overlay);
   overlay.offsetHeight;
+  const dx = toX - fromX, dy = toY - fromY;
   requestAnimationFrame(() => {
-    overlay.style.left = (to[1] * 56) + 'px';
-    overlay.style.top = (to[0] * 56) + 'px';
+    overlay.style.transform = 'translate(' + dx + 'px, ' + dy + 'px)';
   });
-  overlay.addEventListener('transitionend', () => { overlay.remove(); }, { once: true });
+  let done = false;
+  const cleanup = () => {
+    if (done) return;
+    done = true;
+    if (overlay.parentNode) overlay.remove();
+    finishPieceAnimation();
+  };
+  overlay.addEventListener('transitionend', () => cleanup(), { once: true });
+  setTimeout(cleanup, 350);
 }
 
 function updateReplayUI() {
@@ -942,8 +1034,9 @@ function getPstScore(piece, r, c) {
   return t[rr][c] * (isWhitePiece(piece) ? 1 : -1);
 }
 
-// Evaluate board (material + piece-square + learned)
-function evaluateBoard(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove) {
+// Evaluate board (material + piece-square + optional learned)
+// useLearned: false during search for speed (neural net is slow); true for training/display
+function evaluateBoard(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove, useLearned) {
   let score = 0;
   for (let r=0;r<8;r++) {
     for (let c=0;c<8;c++) {
@@ -954,7 +1047,7 @@ function evaluateBoard(stateBoard, stateCastling, stateEnPassant, moveCount, whi
       }
     }
   }
-  score += learnedEval(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove);
+  if (useLearned) score += learnedEval(stateBoard, stateCastling, stateEnPassant, moveCount, whiteToMove);
   return score;
 }
 
@@ -992,7 +1085,7 @@ function orderMoves(stateBoard, moves) {
 // Quiescence search: only captures, prevents horizon effect
 function quiesce(stateBoard, stateCastling, stateEnPassant, alpha, beta, maximizing, qDepth) {
   const whiteToMove = !maximizing;
-  const standPat = evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0, whiteToMove);
+  const standPat = evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0, whiteToMove, false);
   if (maximizing) {
     if (standPat >= beta) return beta;
     if (standPat > alpha) alpha = standPat;
@@ -1020,7 +1113,7 @@ function quiesce(stateBoard, stateCastling, stateEnPassant, alpha, beta, maximiz
 }
 
 // Alpha-beta search with quiescence (reduced depth for responsiveness)
-const SEARCH_DEPTH = 4;
+const SEARCH_DEPTH = 2;
 const QUIESCE_DEPTH = 3;
 
 function alphaBeta(stateBoard, stateCastling, stateEnPassant, depth, alpha, beta, maximizing) {
@@ -1029,7 +1122,7 @@ function alphaBeta(stateBoard, stateCastling, stateEnPassant, depth, alpha, beta
   if (legal.length === 0) {
     const inCheck = isKingInCheck(stateBoard, color, stateCastling, stateEnPassant);
     const whiteToMove = !maximizing;
-    return { score: inCheck ? (maximizing ? -30000 : 30000) : evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0, whiteToMove) };
+    return { score: inCheck ? (maximizing ? -30000 : 30000) : evaluateBoard(stateBoard, stateCastling, stateEnPassant, 0, whiteToMove, false) };
   }
   if (depth === 0) {
     const qScore = quiesce(stateBoard, stateCastling, stateEnPassant, alpha, beta, maximizing, QUIESCE_DEPTH);
@@ -1134,7 +1227,7 @@ function handleBoardClick(event) {
         status.textContent = 'You played ' + coordToAlgebraic(from[0],from[1]) + ' to ' + coordToAlgebraic(to[0],to[1]);
         try { refreshMLStats(); } catch (e) { }
         status.textContent = 'Thinking...';
-        setTimeout(aiMove, 50);
+        setTimeout(aiMove, 300);
       }
     } else {
       // maybe selecting new piece or invalid
@@ -1225,7 +1318,7 @@ function resign() {
   updateEloFromGame(-1);
   document.getElementById('status').textContent = 'You resigned. AI wins!';
   if (moveHistory.length > 0) {
-    const positions = moveHistory.map(({ board: b }) => ({ vec: boardToVector(b), outcome: -1 }));
+    const positions = moveHistory.map(({ board: b }, i) => ({ vec: boardToVector(b, (i % 2) === 1), outcome: -1 }));
     sendGameToServer(positions, -1);
     const raw = localStorage.getItem(STORAGE_KEY) || '[]';
     const games = JSON.parse(raw);
@@ -1288,7 +1381,7 @@ document.querySelectorAll('#promotionPicker .picker-piece').forEach(el => {
       status.textContent = 'You played ' + moveToAlgebraic(mv, board);
       try { refreshMLStats(); } catch (e) { }
       status.textContent = 'Thinking...';
-      setTimeout(aiMove, 50);
+      setTimeout(aiMove, 300);
     }
   });
 });

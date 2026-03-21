@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const { analyzePositions } = require('./stockfish-analyzer');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -42,6 +43,24 @@ app.post('/api/games', (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/analyze - analyze positions with Stockfish, return eval scores 0-1
+app.post('/api/analyze', async (req, res) => {
+  try {
+    const { fens } = req.body;
+    if (!fens || !Array.isArray(fens) || fens.length === 0) {
+      return res.status(400).json({ error: 'Invalid request: fens array required' });
+    }
+    if (fens.length > 50) {
+      return res.status(400).json({ error: 'Max 50 positions per request' });
+    }
+    const evals = await analyzePositions(fens);
+    res.json({ evals });
+  } catch (e) {
+    console.error('Analyze error:', e);
+    res.status(500).json({ error: 'Analysis failed' });
   }
 });
 
